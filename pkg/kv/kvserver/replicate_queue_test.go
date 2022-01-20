@@ -273,6 +273,7 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 	// config asks for 3x replication, and the replication queue will
 	// down-replicate it.
 	require.Len(t, desc.Replicas().Descriptors(), 5)
+
 	// Re-enable the replication queue.
 	tc.ToggleReplicateQueues(true)
 
@@ -288,7 +289,6 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 		}
 		return nil
 	})
-
 	infos, err := filterRangeLog(
 		tc.Conns[0], desc.RangeID, kvserverpb.RangeLogEventType_remove_voter, kvserverpb.ReasonRangeOverReplicated,
 	)
@@ -390,15 +390,17 @@ func TestReplicateQueueUpAndDownReplicateNonVoters(t *testing.T) {
 func checkReplicaCount(
 	ctx context.Context,
 	tc *testcluster.TestCluster,
-	rangeDesc roachpb.RangeDescriptor,
+	rangeDesc *roachpb.RangeDescriptor,
 	voterCount, nonVoterCount int,
 ) (bool, error) {
+	// Force a scan so that the replicate queue acts on the new config and up/down
+	// replicates the range.
 	err := forceScanOnAllReplicationQueues(tc)
 	if err != nil {
 		log.Infof(ctx, "store.ForceReplicationScanAndProcess() failed with: %s", err)
 		return false, err
 	}
-	rangeDesc, err = tc.LookupRange(rangeDesc.StartKey.AsRawKey())
+	*rangeDesc, err = tc.LookupRange(rangeDesc.StartKey.AsRawKey())
 	if err != nil {
 		return false, err
 	}
@@ -443,7 +445,7 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.Eventually(t, func() bool {
-			ok, err := checkReplicaCount(ctx, tc, scratchRange, 1 /* voterCount */, 2 /* nonVoterCount */)
+			ok, err := checkReplicaCount(ctx, tc, &scratchRange, 1 /* voterCount */, 2 /* nonVoterCount */)
 			if err != nil {
 				log.Errorf(ctx, "error checking replica count: %s", err)
 				return false
@@ -462,13 +464,22 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 		// Do a fresh look up on the range descriptor.
 		scratchRange = tc.LookupRangeOrFatal(t, scratchRange.StartKey.AsRawKey())
 		beforeNodeIDs := getNonVoterNodeIDs(scratchRange)
+		store, err := getLeaseholderStore(tc, scratchRange)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// check the value of metrics prior to replacement
+		previousAddCount := store.ReplicateQueueMetrics().AddNonVoterReplicaCount.Count()
+		previousRemovalCount := store.ReplicateQueueMetrics().RemoveNonVoterReplicaCount.Count()
+		previousDecommRemovals := store.ReplicateQueueMetrics().RemoveDecommissioningNonVoterReplicaCount.Count()
+
 		// Decommission each of the two nodes that have the non-voters and make sure
 		// that those non-voters are upreplicated elsewhere.
 		require.NoError(t,
 			tc.Server(0).Decommission(ctx, livenesspb.MembershipStatus_DECOMMISSIONING, beforeNodeIDs))
 
 		require.Eventually(t, func() bool {
-			ok, err := checkReplicaCount(ctx, tc, scratchRange, 1 /* voterCount */, 2 /* nonVoterCount */)
+			ok, err := checkReplicaCount(ctx, tc, &scratchRange, 1 /* voterCount */, 2 /* nonVoterCount */)
 			if err != nil {
 				log.Errorf(ctx, "error checking replica count: %s", err)
 				return false
@@ -489,6 +500,17 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 			}
 			return true
 		}, testutils.DefaultSucceedsSoonDuration, 100*time.Millisecond)
+
+		// assert replica addition and removal metrics increased by 2
+		currentAddCount := store.ReplicateQueueMetrics().AddNonVoterReplicaCount.Count()
+		currentRemoveCount := store.ReplicateQueueMetrics().RemoveNonVoterReplicaCount.Count()
+		currentDecommRemovals := store.ReplicateQueueMetrics().RemoveDecommissioningNonVoterReplicaCount.Count()
+		require.Equal(t, previousAddCount+2, currentAddCount,
+			"metrics; expected %d replica additions; found %d", previousAddCount+2, currentAddCount)
+		require.Equal(t, previousRemovalCount+2, currentRemoveCount,
+			"metrics; expected %d replica removals; found %d", previousRemovalCount+2, currentRemoveCount)
+		require.Equal(t, previousDecommRemovals+2, currentDecommRemovals,
+			"metrics; expected %d decommissioning replica removals; found %d", previousDecommRemovals+2, currentDecommRemovals)
 	})
 
 	// Check that when we have more non-voters than needed and some of those
@@ -514,6 +536,14 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 		for _, repl := range scratchRange.Replicas().NonVoterDescriptors() {
 			nonVoterNodeIDs = append(nonVoterNodeIDs, repl.NodeID)
 		}
+
+		store, err := getLeaseholderStore(tc, scratchRange)
+		if err != nil {
+			t.Fatal(err)
+		}
+		previousRemovalCount := store.ReplicateQueueMetrics().RemoveNonVoterReplicaCount.Count()
+		previousDecommRemovals := store.ReplicateQueueMetrics().RemoveDecommissioningNonVoterReplicaCount.Count()
+
 		require.NoError(t,
 			tc.Server(0).Decommission(ctx, livenesspb.MembershipStatus_DECOMMISSIONING, nonVoterNodeIDs))
 
@@ -522,14 +552,40 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 		// replicateQueue on and ensure that these redundant non-voters are removed.
 		tc.ToggleReplicateQueues(true)
 		require.Eventually(t, func() bool {
-			ok, err := checkReplicaCount(ctx, tc, scratchRange, 1 /* voterCount */, 0 /* nonVoterCount */)
+			ok, err := checkReplicaCount(ctx, tc, &scratchRange, 1 /* voterCount */, 0 /* nonVoterCount */)
 			if err != nil {
 				log.Errorf(ctx, "error checking replica count: %s", err)
 				return false
 			}
 			return ok
 		}, testutils.DefaultSucceedsSoonDuration, 100*time.Millisecond)
+
+		// assert removal metrics increased by 2
+		currentRemoveCount := store.ReplicateQueueMetrics().RemoveNonVoterReplicaCount.Count()
+		currentDecommRemovals := store.ReplicateQueueMetrics().RemoveDecommissioningNonVoterReplicaCount.Count()
+		require.Equal(t, previousRemovalCount+2, currentRemoveCount,
+			"metrics; expected %d replica removals; found %d", previousRemovalCount+2, currentRemoveCount)
+		require.Equal(t, previousDecommRemovals+2, currentDecommRemovals,
+			"metrics; expected %d decommissioning replica removals; found %d", previousDecommRemovals+2, currentDecommRemovals)
 	})
+}
+
+func getLeaseholderStore(tc *testcluster.TestCluster, scratchRange roachpb.RangeDescriptor) (*kvserver.Store, error) {
+	leaseHolder, err := tc.FindRangeLeaseHolder(scratchRange, nil)
+	if err != nil {
+		return nil, err
+	}
+	var store *kvserver.Store
+	for _, s := range tc.Servers {
+		if s.NodeID() == leaseHolder.NodeID {
+			store, err = s.Stores().GetStore(leaseHolder.StoreID)
+			if err != nil {
+				return nil, err
+			}
+			return store, err
+		}
+	}
+	return nil, fmt.Errorf("leaseholder store not found")
 }
 
 // TestReplicateQueueDeadNonVoters is an end to end test ensuring that
@@ -574,7 +630,7 @@ func TestReplicateQueueDeadNonVoters(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.Eventually(t, func() bool {
-			ok, err := checkReplicaCount(ctx, tc, scratchRange, 1 /* voterCount */, 2 /* nonVoterCount */)
+			ok, err := checkReplicaCount(ctx, tc, &scratchRange, 1 /* voterCount */, 2 /* nonVoterCount */)
 			if err != nil {
 				log.Errorf(ctx, "error checking replica count: %s", err)
 				return false
@@ -605,11 +661,20 @@ func TestReplicateQueueDeadNonVoters(t *testing.T) {
 	t.Run("replace", func(t *testing.T) {
 		tc, scratchRange := setupFn(t)
 		defer tc.Stopper().Stop(ctx)
+		store, err := getLeaseholderStore(tc, scratchRange)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// check the value of NonVoterAdditions, NonVoterRemovals prior to replacement
+		prevAdditions := store.ReplicateQueueMetrics().AddNonVoterReplicaCount.Count()
+		prevRemovals := store.ReplicateQueueMetrics().RemoveNonVoterReplicaCount.Count()
+		prevDeadRemovals := store.ReplicateQueueMetrics().RemoveDeadNonVoterReplicaCount.Count()
 
 		beforeNodeIDs := getNonVoterNodeIDs(scratchRange)
 		markDead(beforeNodeIDs)
 		require.Eventually(t, func() bool {
-			ok, err := checkReplicaCount(ctx, tc, scratchRange, 1 /* voterCount */, 2 /* nonVoterCount */)
+			ok, err := checkReplicaCount(ctx, tc, &scratchRange, 1 /* voterCount */, 2 /* nonVoterCount */)
 			if err != nil {
 				log.Errorf(ctx, "error checking replica count: %s", err)
 				return false
@@ -628,8 +693,21 @@ func TestReplicateQueueDeadNonVoters(t *testing.T) {
 					}
 				}
 			}
+
 			return true
 		}, testutils.DefaultSucceedsSoonDuration, 100*time.Millisecond)
+
+		// assert NonVoterAdditions, NonVoterRemovals metrics incremented 2 each.
+		addCount := store.ReplicateQueueMetrics().AddNonVoterReplicaCount.Count()
+		removeNonVoterCount := store.ReplicateQueueMetrics().RemoveNonVoterReplicaCount.Count()
+		removeDeadNonVoterCount := store.ReplicateQueueMetrics().RemoveDeadNonVoterReplicaCount.Count()
+
+		require.Equal(t, prevAdditions+2, addCount, "metrics; expected %d replica additions; found %d",
+			prevAdditions+2, addCount)
+		require.Equal(t, prevRemovals+2, removeNonVoterCount, "metrics; expected %d non-voter replica removals; found %d",
+			prevRemovals+2, removeNonVoterCount)
+		require.Equal(t, prevDeadRemovals+2, removeDeadNonVoterCount, "metrics; expected %d dead replica removals; found %d",
+			prevDeadRemovals+2, removeDeadNonVoterCount)
 	})
 
 	// This subtest checks that when we have more non-voters than needed and some
@@ -655,21 +733,166 @@ func TestReplicateQueueDeadNonVoters(t *testing.T) {
 			"ALTER RANGE default CONFIGURE ZONE USING num_replicas = 1",
 		)
 		require.NoError(t, err)
+
+		store, err := getLeaseholderStore(tc, scratchRange)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		prevRemovals := store.ReplicateQueueMetrics().RemoveReplicaCount.Count()
+		prevNonVoterRemovals := store.ReplicateQueueMetrics().RemoveNonVoterReplicaCount.Count()
+		prevDeadRemovals := store.ReplicateQueueMetrics().RemoveDeadNonVoterReplicaCount.Count()
+
 		beforeNodeIDs := getNonVoterNodeIDs(scratchRange)
 		markDead(beforeNodeIDs)
 
 		toggleReplicationQueues(tc, true)
 		require.Eventually(t, func() bool {
-			ok, err := checkReplicaCount(ctx, tc, scratchRange, 1 /* voterCount */, 0 /* nonVoterCount */)
+			ok, err := checkReplicaCount(ctx, tc, &scratchRange, 1 /* voterCount */, 0 /* nonVoterCount */)
 			if err != nil {
 				log.Errorf(ctx, "error checking replica count: %s", err)
 				return false
 			}
+
 			return ok
 		}, testutils.DefaultSucceedsSoonDuration, 100*time.Millisecond)
+
+		// assert NonVoterRemovals metrics incremented 2.
+		removeCount := store.ReplicateQueueMetrics().RemoveReplicaCount.Count()
+		removeNonVoterCount := store.ReplicateQueueMetrics().RemoveNonVoterReplicaCount.Count()
+		removeDeadNonVoterCount := store.ReplicateQueueMetrics().RemoveDeadNonVoterReplicaCount.Count()
+		require.Equal(t, prevRemovals+2, removeCount, "metrics; expected %d replica removals; found %d",
+			prevRemovals+2, removeCount)
+		require.Equal(t, prevNonVoterRemovals+2, removeNonVoterCount, "metrics; expected %d non-voter replica removals; found %d",
+			prevNonVoterRemovals+2, removeNonVoterCount)
+		require.Equal(t, prevDeadRemovals+2, removeDeadNonVoterCount, "metrics; expected %d dead replica removals; found %d",
+			prevDeadRemovals+2, removeDeadNonVoterCount)
 	})
 }
 
+// TestReplicateQueueMetrics is an end-to-end test ensuring
+// that the replicateQueue metrics will be updated correctly
+func TestReplicateQueueMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderRace(t, "takes a long time or times out under race")
+
+	ctx := context.Background()
+	var clusterArgs = base.TestClusterArgs{
+		ReplicationMode: base.ReplicationAuto,
+		ServerArgs: base.TestServerArgs{
+			ScanMinIdleTime: 1 * time.Millisecond,
+			ScanMaxIdleTime: 1 * time.Millisecond,
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					DisableLoadBasedSplitting: true,
+					DisableReplicaRebalancing: true,
+				},
+			},
+		},
+	}
+	dbName := "testdb"
+	tableName := "kv"
+	numNodes := 3
+	tc, scratchRange := setupTestClusterWithDummyRange(t, clusterArgs, dbName, tableName, numNodes)
+	defer tc.Stopper().Stop(ctx)
+
+	require.Eventually(t, func() bool {
+		ok, err := checkReplicaCount(ctx, tc.(*testcluster.TestCluster), &scratchRange, 3 /* voterCount */, 0 /* nonVoterCount */)
+		if err != nil {
+			log.Errorf(ctx, "error checking replica count: %s", err)
+			return false
+		}
+		return ok
+	}, testutils.DefaultSucceedsSoonDuration, 100*time.Millisecond)
+
+	voters := scratchRange.Replicas().VoterDescriptors()
+	storeIDs := make(map[roachpb.NodeID]roachpb.StoreID)
+	for i := 0; i < len(voters); i++ {
+		storeIDs[voters[i].NodeID] = voters[i].StoreID
+	}
+
+	_, err := tc.ServerConn(0).Exec(`ALTER TABLE testdb.kv CONFIGURE ZONE USING num_replicas = 1`)
+	require.NoError(t, err)
+	testutils.SucceedsSoon(t, func() error {
+		scratchRange = tc.LookupRangeOrFatal(t, scratchRange.StartKey.AsRawKey())
+		if voters := scratchRange.Replicas().VoterDescriptors(); len(voters) != 1 {
+			return errors.Newf("expected 1 voter; got %v", voters)
+		}
+		if nonVoters := scratchRange.Replicas().NonVoterDescriptors(); len(nonVoters) != 0 {
+			return errors.Newf("expected 0 non-voters; got %v", nonVoters)
+		}
+		return nil
+	})
+	var currentRemoveCount int64
+	var currentRemoveVoterCount int64
+	for _, s := range tc.(*testcluster.TestCluster).Servers {
+		if storeId, exists := storeIDs[s.NodeID()]; exists {
+			store, err := s.Stores().GetStore(storeId)
+			if err == nil {
+				currentRemoveCount += store.ReplicateQueueMetrics().RemoveReplicaCount.Count()
+				currentRemoveVoterCount += store.ReplicateQueueMetrics().RemoveVoterReplicaCount.Count()
+			}
+		}
+	}
+
+	require.Equal(t, 2, int(currentRemoveCount), "metrics; expected %d replica removals; found %d",
+		2, int(currentRemoveCount))
+	require.Equal(t, 2, int(currentRemoveVoterCount), "metrics; expected %d voter replica removals; found %d",
+		2, int(currentRemoveVoterCount))
+
+	scratchRange = tc.LookupRangeOrFatal(t, scratchRange.StartKey.AsRawKey())
+	store, err := getLeaseholderStore(tc.(*testcluster.TestCluster), scratchRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousAddCount := store.ReplicateQueueMetrics().AddReplicaCount.Count()
+	previousAddVoterCount := store.ReplicateQueueMetrics().AddVoterReplicaCount.Count()
+
+	_, err = tc.ServerConn(0).Exec(
+		`ALTER TABLE testdb.kv CONFIGURE ZONE USING num_replicas = 3`,
+	)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		ok, err := checkReplicaCount(ctx, tc.(*testcluster.TestCluster), &scratchRange, 3, 0)
+		if err != nil {
+			log.Errorf(ctx, "error checking replica count: %s", err)
+			return false
+		}
+		return ok
+	}, testutils.DefaultSucceedsSoonDuration, 100*time.Millisecond)
+
+	scratchRange = tc.LookupRangeOrFatal(t, scratchRange.StartKey.AsRawKey())
+	voters = scratchRange.Replicas().VoterDescriptors()
+	store, err = getLeaseholderStore(tc.(*testcluster.TestCluster), scratchRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeMap := make(map[roachpb.NodeID]roachpb.StoreID)
+	for i := 0; i < len(voters); i++ {
+		storeMap[voters[i].NodeID] = voters[i].StoreID
+	}
+	// assert add replica count metrics increased by 2
+	var currentAddCount int64
+	var currentAddVoterCount int64
+	for _, s := range tc.(*testcluster.TestCluster).Servers {
+		if storeId, exists := storeMap[s.NodeID()]; exists {
+			store, err := s.Stores().GetStore(storeId)
+			if err == nil {
+				currentAddCount += store.ReplicateQueueMetrics().AddReplicaCount.Count()
+				currentAddVoterCount += store.ReplicateQueueMetrics().AddVoterReplicaCount.Count()
+			}
+		}
+	}
+	//currentAddCount := store.ReplicateQueueMetrics().AddReplicaCount.Count()
+	//currentAddVoterCount := store.ReplicateQueueMetrics().AddVoterReplicaCount.Count()
+	require.Equal(t, previousAddCount+2, currentAddCount, "expected add replica metric %d; found %d",
+		previousAddCount+2, currentAddCount)
+	require.Equal(t, previousAddVoterCount+2, currentAddVoterCount, "expected add voter replica metric %d; found %d",
+		previousAddVoterCount+2, currentAddVoterCount)
+
+}
 func getNonVoterNodeIDs(rangeDesc roachpb.RangeDescriptor) (result []roachpb.NodeID) {
 	for _, repl := range rangeDesc.Replicas().NonVoterDescriptors() {
 		result = append(result, repl.NodeID)

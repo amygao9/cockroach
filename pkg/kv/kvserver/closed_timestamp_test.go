@@ -1235,7 +1235,7 @@ WHERE table_name = '%s' AND database_name = '%s'`, tableName, dbName),
 		})
 	}
 	startKey := getEncodedKeyForTable(t, tc.ServerConn(0), dbName, tableName, tree.NewDInt(0))
-	_, desc, err = tc.Server(0).SplitRange(startKey)
+	desc, err = tc.LookupRange(startKey)
 	require.NoError(t, err)
 	return tc, desc
 }
